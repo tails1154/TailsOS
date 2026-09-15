@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <PackageId>Cosmos.Kernel.Native.MultiArch</PackageId>
+    <Title>Cosmos Kernel Multi-Arch Native C</Title>
+    <Description>Shared native C sources for Cosmos kernel (x64 and arm64).</Description>
+    <PackageTags>cosmos;kernel;native;c;multiarch</PackageTags>
+    <PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="build\Cosmos.Kernel.Native.MultiArch.props" PackagePath="build\" />
+    <Content Include="C\*.c" PackagePath="build\C" />
+    <Content Include="ACPI\*.c" PackagePath="build\ACPI" />
+    <Content Include="ACPI\lai\core\*.c" PackagePath="build\ACPI\lai\core" />
+    <Content Include="ACPI\lai\core\*.h" PackagePath="build\ACPI\lai\core" />
+    <Content Include="ACPI\lai\helpers\*.c" PackagePath="build\ACPI\lai\helpers" />
+    <Content Include="ACPI\lai\drivers\*.c" PackagePath="build\ACPI\lai\drivers" />
+    <Content Include="ACPI\lai\include\**\*.h" PackagePath="build\ACPI\lai\include" />
+  </ItemGroup>
+</Project>

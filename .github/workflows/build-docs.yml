@@ -1,0 +1,83 @@
+name: Build Docs
+
+on:
+  push:
+    branches: [ main, gen3 ]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/build-docs.yml'
+  # Build on PRs too, without publishing. docfx.json names four projects by
+  # path, and the articles link into src/; either can break without anything
+  # failing until the merge lands on main.
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.github/workflows/build-docs.yml'
+
+jobs:
+  build:
+    # ubuntu, not windows: the deploy_key mode of peaceiris/actions-gh-pages
+    # cannot reach the Windows ssh-agent service (ssh-add exits with
+    # "Error connecting to agent").
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Install DocFX
+      run: |
+        dotnet tool update -g docfx
+        echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+    # Restore only what DocFX consumes (the src/Cosmos.Kernel.* projects).
+    # Restoring nativeaot-patcher.slnx pulls in examples/DevKernel, whose
+    # NuGet.Config requires the artifacts/package/release local source — that
+    # folder doesn't exist on a fresh checkout, so the slnx restore fails with
+    # NU1301. Cosmos.Kernel transitively project-references everything DocFX
+    # needs, so restoring it alone is sufficient and avoids the local source.
+    - name: Restore docs projects
+      run: dotnet restore src/Cosmos.Kernel/Cosmos.Kernel.csproj
+
+    - name: Build Docs
+      run: |
+        cd docs
+        docfx docfx.json
+
+    - name: Verify output
+      run: find docs/_site -type f | head -50
+
+    # keep_files: the dev site lives at the root of the published branch, next
+    # to the frozen per-release copies (v*/ subfolders, latest/, versions.json)
+    # that release.yml publishes on tags. Without it every dev deploy would
+    # wipe them. Tradeoff: files deleted from docs/ linger on the branch until
+    # overwritten; acceptable, they are unreachable from the rebuilt site.
+    - name: Publish to GitHub Pages
+      if: github.event_name == 'push' && github.repository == 'valentinbreiz/nativeaot-patcher'
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        publish_branch: gh-pages
+        publish_dir: ./docs/_site
+        keep_files: true
+
+    # Same mechanism as the gen2 docs CD, but authenticated with a write
+    # deploy key of the org Pages repository instead of the expired GH_PAGES
+    # PAT. The site is served at https://cosmosos.github.io/.
+    - name: Publish to cosmosos.github.io
+      if: github.event_name == 'push' && github.repository == 'CosmosOS/Cosmos'
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+        deploy_key: ${{ secrets.GH_PAGES_DEPLOY_KEY }}
+        external_repository: CosmosOS/cosmosos.github.io
+        publish_branch: master
+        publish_dir: ./docs/_site
+        keep_files: true

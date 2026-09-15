@@ -1,0 +1,48 @@
+name: Mirror to CosmosOS/Cosmos
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-gen3
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Push main to gen3 and gen3-dev
+    runs-on: ubuntu-latest
+    if: github.repository == 'valentinbreiz/nativeaot-patcher'
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Authenticated with a write deploy key of CosmosOS/Cosmos: deploy keys
+      # need no org approval, never expire, and may push workflow files.
+      - name: 🪞 Force-push to CosmosOS/Cosmos
+        env:
+          MIRROR_DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$MIRROR_DEPLOY_KEY" > ~/.ssh/mirror_key
+          chmod 600 ~/.ssh/mirror_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/mirror_key"
+          remote=git@github.com:CosmosOS/Cosmos.git
+
+          # A release tag forwards on its own: the branch push that preceded it
+          # already carried the commit, and release.yml has to fire over there
+          # because the nuget.org Trusted Publishing policy only trusts
+          # CosmosOS/Cosmos. Tags are never force-pushed.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            git push "$remote" "$GITHUB_REF:$GITHUB_REF"
+          else
+            git push --force "$remote" \
+              HEAD:refs/heads/gen3 \
+              HEAD:refs/heads/gen3-dev
+          fi
