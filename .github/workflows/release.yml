@@ -1,0 +1,469 @@
+name: Release
+
+# Single source of version = git tag.
+# Push a `v*` tag (e.g. `v3.0.44`) to:
+#   1. Build all NuGet packages with VersionPrefix=<tag>
+#   2. Publish them to NuGet.org
+#   3. Build the Windows installer
+#   4. Create a GitHub release
+#   5. Publish a frozen copy of the docs under vX.Y.Z/ (plus latest/ and
+#      versions.json, consumed by the version dropdown)
+#
+# The tag releases from both remotes: mirror-gen3.yml forwards `v*` to
+# CosmosOS/Cosmos, so each repository builds its own installer, GitHub release
+# and versioned docs. Step 2 is the exception: nuget.org grants the publish
+# credential to CosmosOS/Cosmos alone (see publish-nuget), so packages reach
+# nuget.org exactly once, under the CosmosOS profile.
+#
+# `workflow_dispatch` is available for manual reruns / testing; manual runs
+# only build artifacts and DO NOT publish to NuGet or create a GitHub release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g., 3.0.44). Leave empty to derive from global.json.'
+        required: false
+        type: string
+      docs_tag:
+        description: 'Backfill versioned docs for an existing tag (e.g. v3.0.82). Only runs publish-docs.'
+        required: false
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+env:
+  DOTNET_VERSION: '10.0.x'
+
+jobs:
+  # ── Build all NuGet packages ─────────────────────────────────────────────────
+  build-packages:
+    name: Build Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 🛠️ Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 🔧 Cache Build Tools
+        id: cache-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.cosmos/tools
+          key: cosmos-tools-linux-x64-${{ hashFiles('.github/workflows/build-tools.yml') }}
+
+      - name: ⬇️ Download Build Tools
+        if: steps.cache-tools.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TOOLS_DIR="$HOME/.cosmos/tools"
+          mkdir -p "$TOOLS_DIR"
+          echo "Downloading tools from release: tools-latest"
+          for asset in llvm-tools xorriso qemu; do
+            gh release download tools-latest --pattern "${asset}-*-linux-x64.tar.gz" --dir /tmp/cosmos-tools
+            tar xzf /tmp/cosmos-tools/${asset}-*-linux-x64.tar.gz -C "$TOOLS_DIR"
+          done
+
+      - name: 🔗 Add Tools to PATH
+        run: |
+          TOOLS_DIR="$HOME/.cosmos/tools"
+          echo "$TOOLS_DIR/llvm-tools/bin" >> $GITHUB_PATH
+          echo "$TOOLS_DIR/xorriso" >> $GITHUB_PATH
+          echo "$TOOLS_DIR/qemu" >> $GITHUB_PATH
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            version="${{ inputs.version }}"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            # Fallback: read from global.json `msbuild-sdks.Cosmos.Sdk`
+            version=$(grep -oP '"Cosmos\.Sdk"\s*:\s*"\K[^"]+' global.json)
+          fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Using version: $version"
+
+      - name: 🔨 Build packages
+        env:
+          # Single source of truth: $(VersionPrefix) flows from this env var into
+          # every Cosmos package via Directory.Build.props, Directory.Packages.props,
+          # the Cosmos.Sdk Sdk.props pack-time substitution, the Cosmos.Build.Templates
+          # template, Cosmos.Kernel's KernelVersion.g.cs / kmain_version.h codegen,
+          # and the BuildCache test fixture. postCreateCommand.sh also rewrites
+          # global.json `msbuild-sdks.Cosmos.Sdk` to this value so in-repo kernels
+          # using `<Sdk Name="Cosmos.Sdk" />` resolve the CI-built package.
+          VersionPrefix: ${{ steps.version.outputs.version }}
+        run: |
+          dotnet nuget locals all --clear
+          ./.devcontainer/postCreateCommand.sh
+
+      # Final breaking-change guard on the API-tracked packages, comparing the
+      # freshly built nupkg against the CosmosApiBaselineVersion release on
+      # NuGet.org. Inert until that property is set in Directory.Build.props
+      # (first Gen3 release): pack-time package validation is also keyed on it.
+      - name: 🛡️ API compatibility guard
+        run: |
+          baseline=$(grep -oP '<CosmosApiBaselineVersion>\K[^<]+' Directory.Build.props || true)
+          if [[ -z "$baseline" ]]; then
+            echo "CosmosApiBaselineVersion is empty (no Gen3 release on NuGet yet): skipping."
+            exit 0
+          fi
+          dotnet tool install -g Microsoft.DotNet.ApiCompat.Tool
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          for id in Cosmos.Kernel.System; do
+            lower=$(echo "$id" | tr '[:upper:]' '[:lower:]')
+            echo "Comparing $id ${{ steps.version.outputs.version }} against baseline $baseline"
+            curl -sSfL \
+              "https://api.nuget.org/v3-flatcontainer/$lower/$baseline/$lower.$baseline.nupkg" \
+              -o "/tmp/$lower.baseline.nupkg"
+            apicompat package \
+              --baseline-package "/tmp/$lower.baseline.nupkg" \
+              "artifacts/package/release/$id.${{ steps.version.outputs.version }}.nupkg"
+          done
+
+      - name: 📤 Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosmos-packages
+          path: artifacts/package/release/*.nupkg
+          retention-days: 7
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+  # ── Publish to NuGet (tag pushes on CosmosOS/Cosmos only) ────────────────────
+  # Authenticated by nuget.org Trusted Publishing, so no API key is stored
+  # anywhere: the job trades its GitHub OIDC token for a key that lives one
+  # hour and may only touch packages owned by the CosmosOS profile. The policy
+  # matches on repository owner, repository name, this workflow's file name and
+  # the `production` environment, so renaming this file, moving the job to
+  # another repository or dropping the environment all break publishing.
+  publish-nuget:
+    name: Publish to NuGet
+    needs: build-packages
+    if: github.repository == 'CosmosOS/Cosmos' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: cosmos-packages
+          path: packages
+
+      # Keep this immediately before the push: the key expires after an hour,
+      # and one OIDC token buys exactly one key.
+      - name: NuGet login
+        id: login
+        uses: NuGet/login@v1
+        with:
+          # The user who CREATED the policy, not the CosmosOS profile that owns
+          # it. nuget.org looks the policy up by creator and answers a wrong
+          # guess with "No matching trust policy owned by user 'CosmosOS' was
+          # found" (HTTP 401). Public, so not a secret. If the policy is ever
+          # recreated by somebody else, this has to follow them.
+          user: valentinbreiz
+
+      - name: Push to NuGet
+        run: |
+          for pkg in packages/*.nupkg; do
+            dotnet nuget push "$pkg" \
+              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
+
+  # ── Versioned docs ───────────────────────────────────────────────────────────
+  # Freezes the docs of a release under vX.Y.Z/ on the Pages site, refreshes
+  # the latest/ alias, and rewrites versions.json (read by the version dropdown
+  # in docs/templates/custom). The dev site that build-docs.yml publishes at
+  # the site root keeps these folders thanks to its keep_files: true.
+  #
+  # Runs on v* tag pushes; dispatching with docs_tag backfills a tag released
+  # before this job existed (docs built from the tag's source, current
+  # templates/custom overlaid so the frozen pages carry the version dropdown).
+  publish-docs:
+    name: Publish Versioned Docs
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.docs_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.docs_tag || github.ref }}
+
+      # The one place the per-repository mapping is stated. nativeaot-patcher
+      # serves the site from its own gh-pages branch; CosmosOS/Cosmos serves it
+      # from CosmosOS/cosmosos.github.io, the target build-docs.yml already
+      # deploys the dev site to. source_branch is the branch holding the
+      # current templates, used by the backfill overlay below.
+      - name: Resolve docs target
+        id: target
+        run: |
+          if [[ "$GITHUB_REPOSITORY" == "CosmosOS/Cosmos" ]]; then
+            echo "pages_repository=CosmosOS/cosmosos.github.io" >> "$GITHUB_OUTPUT"
+            echo "pages_branch=master" >> "$GITHUB_OUTPUT"
+            echo "source_branch=gen3" >> "$GITHUB_OUTPUT"
+          else
+            echo "pages_repository=$GITHUB_REPOSITORY" >> "$GITHUB_OUTPUT"
+            echo "pages_branch=gh-pages" >> "$GITHUB_OUTPUT"
+            echo "source_branch=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Overlay current template (backfill only)
+        if: inputs.docs_tag != ''
+        run: |
+          git fetch origin ${{ steps.target.outputs.source_branch }} --depth=1
+          git checkout FETCH_HEAD -- docs/templates/custom
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Install DocFX
+        run: |
+          dotnet tool update -g docfx
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      # Same restore scope as build-docs.yml: Cosmos.Kernel transitively
+      # project-references everything the DocFX metadata pass compiles.
+      - name: Restore docs projects
+        run: dotnet restore src/Cosmos.Kernel/Cosmos.Kernel.csproj
+
+      - name: Build Docs
+        run: |
+          cd docs
+          docfx docfx.json
+
+      # versions.json lists the frozen releases already on gh-pages plus this
+      # one, newest first. The dropdown adds the dev entry (site root) itself.
+      - name: Compose versions.json
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ inputs.docs_tag }}"
+          if [[ -z "$version" ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/pages-root
+          # Both Pages targets are public, so the job token can list either.
+          # An empty listing (branch not created yet) is a valid first release.
+          {
+            gh api "repos/${{ steps.target.outputs.pages_repository }}/contents?ref=${{ steps.target.outputs.pages_branch }}" \
+              --jq '.[] | select(.type == "dir") | .name' 2>/dev/null | grep -E '^v[0-9]' || true
+            echo "$version"
+          } | sort -uVr > /tmp/versions.txt
+          # A backfilled old tag must not steal the latest/ alias.
+          newest=$(head -1 /tmp/versions.txt)
+          echo "is_latest=$([[ "$newest" == "$version" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          python3 -c '
+          import json, sys
+          versions = [line.strip() for line in open("/tmp/versions.txt") if line.strip()]
+          json.dump({"latest": versions[0], "versions": versions}, sys.stdout, indent=2)
+          ' > /tmp/pages-root/versions.json
+          cat /tmp/pages-root/versions.json
+
+      # Everything this release changes on the Pages site, assembled into one
+      # tree: the frozen vX.Y.Z copy, the latest/ alias when this really is the
+      # newest release, and versions.json. It ships in a single deploy because
+      # peaceiris/actions-gh-pages starts an ssh-agent on a fixed socket path,
+      # so a second deploy_key step in the same job dies on the socket the
+      # first one left behind.
+      - name: Assemble Pages payload
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p "/tmp/pages-out/$version"
+          cp -r docs/_site/. "/tmp/pages-out/$version/"
+          if [[ "${{ steps.version.outputs.is_latest }}" == "true" ]]; then
+            mkdir -p /tmp/pages-out/latest
+            cp -r docs/_site/. /tmp/pages-out/latest/
+          fi
+          cp /tmp/pages-root/versions.json /tmp/pages-out/versions.json
+          find /tmp/pages-out -maxdepth 1 -mindepth 1 -printf '%f\n' | sort
+
+      # keep_files: the dev site build-docs.yml publishes at the root has to
+      # survive, and so do the frozen copies of earlier releases.
+      - name: Publish to gh-pages
+        if: github.repository != 'CosmosOS/Cosmos'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: ${{ steps.target.outputs.pages_branch }}
+          publish_dir: /tmp/pages-out
+          keep_files: true
+
+      # Separate repository, so the job token does not reach it: same write
+      # deploy key build-docs.yml uses for the dev site.
+      - name: Publish to the org site
+        if: github.repository == 'CosmosOS/Cosmos'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          deploy_key: ${{ secrets.GH_PAGES_DEPLOY_KEY }}
+          external_repository: ${{ steps.target.outputs.pages_repository }}
+          publish_branch: ${{ steps.target.outputs.pages_branch }}
+          publish_dir: /tmp/pages-out
+          keep_files: true
+
+  # ── Windows Installer ────────────────────────────────────────────────────────
+  build-installer-windows:
+    name: Windows Installer
+    needs: build-packages
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: cosmos-packages
+          path: setup/bundle/packages
+
+      - name: Install cosmos CLI
+        run: dotnet tool install -g Cosmos.Tools --add-source setup/bundle/packages
+        shell: pwsh
+
+      - name: Build installer via cosmos install
+        run: cosmos install --auto --setup setup/bundle
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-windows
+          path: setup/output/CosmosSetup-*.exe
+          retention-days: 30
+
+  # ── Create GitHub Release ────────────────────────────────────────────────────
+  create-release:
+    name: Create Release
+    needs: [build-packages, publish-nuget, build-installer-windows]
+    # publish-nuget is skipped on every repository but CosmosOS/Cosmos, and a
+    # skipped dependency would otherwise skip this job too. A NuGet failure
+    # still blocks the release.
+    if: >-
+      !cancelled()
+      && startsWith(github.ref, 'refs/tags/v')
+      && needs.build-packages.result == 'success'
+      && needs.build-installer-windows.result == 'success'
+      && needs.publish-nuget.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: false
+
+      - name: Compose release name and notes
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.build-packages.outputs.version }}"
+
+          # CosmosOS/Cosmos keeps the naming its releases have carried since the
+          # Gen2 User Kits: the UTC build date the kits were stamped with, plus
+          # the build it ships, so "User Kit 20260915 (3.0.85)" beside the old
+          # "User Kit 20221121". The tag stays v3.0.85 on both remotes, because
+          # that is what triggers this run and what versions the packages.
+          if [[ "$GITHUB_REPOSITORY" == "CosmosOS/Cosmos" ]]; then
+            echo "name=User Kit $(date -u +%Y%m%d) ($version)" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=v$version" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Left alone, GitHub diffs against whatever release is newest, and on
+          # CosmosOS/Cosmos that is the rolling tools-latest, which shares no
+          # history with the source. Pin the base to the highest earlier Gen3
+          # release of this repository instead. The pattern has to be strict:
+          # CosmosOS/Cosmos also carries a v0.20150130 release from Gen2 that a
+          # looser `^v[0-9]` would happily pick.
+          previous=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName \
+            --jq '.[] | select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tagName' \
+            | grep -vx "v$version" | sort -Vr | head -1)
+          if [[ -n "$previous" ]]; then
+            echo "generate=true" >> "$GITHUB_OUTPUT"
+            echo "previous_tag=$previous" >> "$GITHUB_OUTPUT"
+            echo "extra=" >> "$GITHUB_OUTPUT"
+          else
+            # No earlier v* release here, so there is nothing to diff: the first
+            # Gen3 release on this remote points readers at the roadmap instead
+            # of a changelog against an unrelated tag.
+            echo "generate=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "extra<<RELEASE_EXTRA"
+              echo ""
+              echo "### What's in this release"
+              echo ""
+              echo "First Gen3 release published from this repository. See the"
+              echo "[roadmap](https://cosmosos.github.io/roadmap.html) for what"
+              echo "is done and what is next."
+              echo "RELEASE_EXTRA"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ steps.release.outputs.name }}
+          body: |
+            ### Downloads
+
+            | Platform | File | Notes |
+            |----------|------|-------|
+            | Windows | `CosmosSetup-${{ needs.build-packages.outputs.version }}-windows.exe` | Requires .NET 10 SDK, run installer |
+            | Linux / macOS | `dotnet tool install -g Cosmos.Tools && cosmos install` | Requires .NET 10 SDK |
+
+            Already installed? Run `cosmos update` to move to this release, or `dotnet tool update -g Cosmos.Tools && cosmos install` if your CLI predates the update command.
+
+            ### Prerequisites
+
+            - [.NET 10 SDK](https://dot.net/download)
+
+            ### Quick Start
+
+            - [Installation guide](https://cosmosos.github.io/articles/user/install.html)
+            ${{ steps.release.outputs.extra }}
+          # Append the changelog GitHub generates from the pull requests merged
+          # since previous_tag. Off for the first release on a remote, which has
+          # no earlier v* tag to compare against.
+          generate_release_notes: ${{ steps.release.outputs.generate }}
+          previous_tag: ${{ steps.release.outputs.previous_tag }}
+          draft: false
+          prerelease: false
+          files: |
+            installers/installer-windows/*

@@ -1,0 +1,18 @@
+- name: Installation Guide
+  href: install.md
+- name: Kernel Startup
+  href: startup.md
+- name: File System
+  href: filesystem.md
+- name: Network
+  href: network.md
+- name: Timers and Alarms
+  href: timers.md
+- name: Graphics
+  href: graphics.md
+- name: Keyboard
+  href: keyboard.md
+- name: Mouse
+  href: mouse.md
+- name: Debugging with VSCode and QEMU
+  href: debugging.md
